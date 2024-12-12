@@ -721,12 +721,13 @@ class PositionWiseFeedForward(nn.Module):
         h = self.W_out(h)
         return h
 
+
 class PositionalEncodings(nn.Module):
     def __init__(self, num_embeddings, max_relative_feature=32):
         super(PositionalEncodings, self).__init__()
         self.num_embeddings = num_embeddings
         self.max_relative_feature = max_relative_feature
-        self.linear = nn.Linear(2*max_relative_feature+1+1, num_embeddings)
+        self.linear = nn.Linear(2*max_relative_feature+1+1, num_embeddings)    
 
     def forward(self, offset, mask):
         d = torch.clip(offset + self.max_relative_feature, 0, 2*self.max_relative_feature)*mask + (1-mask)*(2*self.max_relative_feature+1)
@@ -735,6 +736,43 @@ class PositionalEncodings(nn.Module):
         return E
 
 
+def cyclic_offset(peptide_length, device='cpu') -> torch.Tensor:
+        # each subsequent row is a rotation of the distances 
+        #   (positive and negative distances as negative, if backwards in sequence, positive if forwards), the same is in AlphaFold2
+        #   the row aa is to_aa and the col aa is from_aa
+
+        # first row: how far is aa1 from aa1, aa2, aa3, ... (therefore start with 0, then -1, -2 etc.)
+        cyc_row = torch.arange(0, -peptide_length, -1, device=device)
+        # Now after the center the shorter path to get to the first amino-acid is to go forward
+        #   so do that get the after-center index
+
+        # in EvoBind there is this, but that's not optimal (wrt abs. distance) for odd peptides
+        # c = (peptide_length + 1) // 2
+        c = peptide_length // 2
+        
+        # (In even length peptides there are two possibilities with same abs value, either - or +,
+        #   in EvoBind they chose -, so we are doing it the same here)
+        cyc_row[c+1:] = torch.arange(peptide_length - c - 1, 0, -1, device=device)
+
+        # Create the cyclic offset array by rolling the rows
+        cyclic_offset_array = torch.stack([torch.roll(cyc_row, i) for i in range(peptide_length)])
+        return cyclic_offset_array
+
+
+def maybe_add_cyclic_offset(offset, cyclic_peptide_mask):
+    if cyclic_peptide_mask is not None:
+        # now modify the offset for the cyclic peptide, offset has shape (B, L, L)
+        # cyclic peptide mask is assumed to be contiguous
+        # we want to modify offset[:, cyclic_peptide_mask, cyclic_peptide_mask]
+
+        for b in range(offset.size(0)):  # for simplicity, iterate over batch dim in python
+            # Get the indices of the cyclic peptide
+            peptide_indices = torch.nonzero(cyclic_peptide_mask[b], as_tuple=True)[0] 
+
+            # Finally modify the entire offset array
+            grid_i, grid_j = torch.meshgrid(peptide_indices, peptide_indices, indexing='ij')
+            offset[b, grid_i, grid_j] = cyclic_offset(len(peptide_indices), device=offset.device)
+        
 
 class CA_ProteinFeatures(nn.Module):
     def __init__(self, edge_features, node_features, num_positional_embeddings=16,
@@ -867,7 +905,7 @@ class CA_ProteinFeatures(nn.Module):
         RBF_A_B = self._rbf(D_A_B_neighbors)
         return RBF_A_B
 
-    def forward(self, Ca, mask, residue_idx, chain_labels):
+    def forward(self, Ca, mask, residue_idx, chain_labels, cyclic_peptide_mask=None):
         """ Featurize coordinates as an attributed graph """
         if self.augment_eps > 0:
             Ca = Ca + self.augment_eps * torch.randn_like(Ca)
@@ -901,6 +939,7 @@ class CA_ProteinFeatures(nn.Module):
 
 
         offset = residue_idx[:,:,None]-residue_idx[:,None,:]
+        maybe_add_cyclic_offset(offset, cyclic_peptide_mask)  # do here, before gathering only some edges..
         offset = gather_edges(offset[:,:,:,None], E_idx)[:,:,:,0] #[B, L, K]
 
         d_chains = ((chain_labels[:, :, None] - chain_labels[:,None,:])==0).long()
@@ -960,7 +999,7 @@ class ProteinFeatures(nn.Module):
         RBF_A_B = self._rbf(D_A_B_neighbors)
         return RBF_A_B
 
-    def forward(self, X, mask, residue_idx, chain_labels):
+    def forward(self, X, mask, residue_idx, chain_labels, cyclic_peptide_mask=None):
         if self.augment_eps > 0:
             X = X + self.augment_eps * torch.randn_like(X)
         
@@ -1004,6 +1043,7 @@ class ProteinFeatures(nn.Module):
         RBF_all = torch.cat(tuple(RBF_all), dim=-1)
 
         offset = residue_idx[:,:,None]-residue_idx[:,None,:]
+        maybe_add_cyclic_offset(offset, cyclic_peptide_mask)  # do here, before gathering only some edges..
         offset = gather_edges(offset[:,:,:,None], E_idx)[:,:,:,0] #[B, L, K]
 
         d_chains = ((chain_labels[:, :, None] - chain_labels[:,None,:])==0).long() #find self vs non-self interaction
@@ -1054,11 +1094,11 @@ class ProteinMPNN(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, randn, use_input_decoding_order=False, decoding_order=None):
+    def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, randn, use_input_decoding_order=False, decoding_order=None, cyclic_peptide_mask=None):
         """ Graph-conditioned sequence model """
         device=X.device
         # Prepare node and edge embeddings
-        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         h_E = self.W_e(E)
 
@@ -1101,10 +1141,10 @@ class ProteinMPNN(nn.Module):
 
 
 
-    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, bias_by_res=None):
+    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, bias_by_res=None, cyclic_peptide_mask=None):
         device = X.device
         # Prepare node and edge embeddings
-        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
         h_E = self.W_e(E)
 
@@ -1188,10 +1228,10 @@ class ProteinMPNN(nn.Module):
         return output_dict
 
 
-    def tied_sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, tied_pos=None, tied_beta=None, bias_by_res=None):
+    def tied_sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, tied_pos=None, tied_beta=None, bias_by_res=None, cyclic_peptide_mask=None):
         device = X.device
         # Prepare node and edge embeddings
-        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
         h_E = self.W_e(E)
         # Encoder is unmasked self-attention
@@ -1289,11 +1329,11 @@ class ProteinMPNN(nn.Module):
         return output_dict
 
 
-    def conditional_probs(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, randn, backbone_only=False):
+    def conditional_probs(self, X, S, mask, chain_M, residue_idx, chain_encoding_all, randn, backbone_only=False, cyclic_peptide_mask=None):
         """ Graph-conditioned sequence model """
         device=X.device
         # Prepare node and edge embeddings
-        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask)
         h_V_enc = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         h_E = self.W_e(E)
 
@@ -1349,11 +1389,11 @@ class ProteinMPNN(nn.Module):
         return log_conditional_probs
 
 
-    def unconditional_probs(self, X, mask, residue_idx, chain_encoding_all):
+    def unconditional_probs(self, X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask=None):
         """ Graph-conditioned sequence model """
         device=X.device
         # Prepare node and edge embeddings
-        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
+        E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         h_E = self.W_e(E)
 

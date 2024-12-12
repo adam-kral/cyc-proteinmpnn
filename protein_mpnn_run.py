@@ -234,6 +234,14 @@ def main(args):
             S_sample_list = []
             batch_clones = [copy.deepcopy(protein) for i in range(BATCH_COPIES)]
             X, S, mask, lengths, chain_M, chain_encoding_all, chain_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(batch_clones, device, chain_id_dict, fixed_positions_dict, omit_AA_dict, tied_positions_dict, pssm_dict, bias_by_res_dict, ca_only=args.ca_only)
+            # chain_enconding_all is 1-based index into chain_list_list (both have batch dims)
+            if args.cyclic_peptide_chain:
+                _, chain_index = np.nonzero(np.array(chain_list_list) == args.cyclic_peptide_chain)
+                cyclic_peptide_mask = chain_encoding_all == torch.tensor(chain_index+1, device=device)[:, None]
+
+            else:
+                cyclic_peptide_mask = None
+            
             pssm_log_odds_mask = (pssm_log_odds_all > args.pssm_threshold).float() #1.0 for true, 0.0 for false
             name_ = batch_clones[0]['name']
             if args.score_only:
@@ -254,7 +262,7 @@ def main(args):
                         S[:,:input_seq_length] = S_input #assumes that S and S_input are alphabetically sorted for masked_chains
                     for j in range(NUM_BATCHES):
                         randn_1 = torch.randn(chain_M.shape, device=X.device)
-                        log_probs = model(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1)
+                        log_probs = model(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1, cyclic_peptide_mask=cyclic_peptide_mask)
                         mask_for_loss = mask*chain_M*chain_M_pos
                         scores = _scores(S, log_probs, mask_for_loss)
                         native_score = scores.cpu().data.numpy()
@@ -289,7 +297,7 @@ def main(args):
                 log_conditional_probs_list = []
                 for j in range(NUM_BATCHES):
                     randn_1 = torch.randn(chain_M.shape, device=X.device)
-                    log_conditional_probs = model.conditional_probs(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1, args.conditional_probs_only_backbone)
+                    log_conditional_probs = model.conditional_probs(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1, args.conditional_probs_only_backbone, cyclic_peptide_mask=cyclic_peptide_mask)
                     log_conditional_probs_list.append(log_conditional_probs.cpu().numpy())
                 concat_log_p = np.concatenate(log_conditional_probs_list, 0) #[B, L, 21]
                 mask_out = (chain_M*chain_M_pos*mask)[0,].cpu().numpy()
@@ -300,14 +308,14 @@ def main(args):
                 unconditional_probs_only_file = base_folder + '/unconditional_probs_only/' + batch_clones[0]['name']
                 log_unconditional_probs_list = []
                 for j in range(NUM_BATCHES):
-                    log_unconditional_probs = model.unconditional_probs(X, mask, residue_idx, chain_encoding_all)
+                    log_unconditional_probs = model.unconditional_probs(X, mask, residue_idx, chain_encoding_all, cyclic_peptide_mask=cyclic_peptide_mask)
                     log_unconditional_probs_list.append(log_unconditional_probs.cpu().numpy())
                 concat_log_p = np.concatenate(log_unconditional_probs_list, 0) #[B, L, 21]
                 mask_out = (chain_M*chain_M_pos*mask)[0,].cpu().numpy()
                 np.savez(unconditional_probs_only_file, log_p=concat_log_p, S=S[0,].cpu().numpy(), mask=mask[0,].cpu().numpy(), design_mask=mask_out)
             else:
                 randn_1 = torch.randn(chain_M.shape, device=X.device)
-                log_probs = model(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1)
+                log_probs = model(X, S, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_1, cyclic_peptide_mask=cyclic_peptide_mask)
                 mask_for_loss = mask*chain_M*chain_M_pos
                 scores = _scores(S, log_probs, mask_for_loss) #score only the redesigned part
                 native_score = scores.cpu().data.numpy()
@@ -325,13 +333,13 @@ def main(args):
                         for j in range(NUM_BATCHES):
                             randn_2 = torch.randn(chain_M.shape, device=X.device)
                             if tied_positions_dict == None:
-                                sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), bias_by_res=bias_by_res_all)
+                                sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), bias_by_res=bias_by_res_all, cyclic_peptide_mask=cyclic_peptide_mask)
                                 S_sample = sample_dict["S"] 
                             else:
-                                sample_dict = model.tied_sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), tied_pos=tied_pos_list_of_lists_list[0], tied_beta=tied_beta, bias_by_res=bias_by_res_all)
+                                sample_dict = model.tied_sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), tied_pos=tied_pos_list_of_lists_list[0], tied_beta=tied_beta, bias_by_res=bias_by_res_all, cyclic_peptide_mask=cyclic_peptide_mask)
                             # Compute scores
                                 S_sample = sample_dict["S"]
-                            log_probs = model(X, S_sample, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_2, use_input_decoding_order=True, decoding_order=sample_dict["decoding_order"])
+                            log_probs = model(X, S_sample, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_2, use_input_decoding_order=True, decoding_order=sample_dict["decoding_order"], cyclic_peptide_mask=cyclic_peptide_mask)
                             mask_for_loss = mask*chain_M*chain_M_pos
                             scores = _scores(S_sample, log_probs, mask_for_loss)
                             scores = scores.cpu().data.numpy()
@@ -415,55 +423,58 @@ def main(args):
                 if print_all:
                     print(f'{num_seqs} sequences of length {total_length} generated in {dt} seconds')
    
+
+argparser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+argparser.add_argument("--suppress_print", type=int, default=0, help="0 for False, 1 for True")
+
+
+argparser.add_argument("--ca_only", action="store_true", default=False, help="Parse CA-only structures and use CA-only models (default: false)")   
+argparser.add_argument("--path_to_model_weights", type=str, default="", help="Path to model weights folder;") 
+argparser.add_argument("--model_name", type=str, default="v_48_020", help="ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030; v_48_010=version with 48 edges 0.10A noise")
+argparser.add_argument("--use_soluble_model", action="store_true", default=False, help="Flag to load ProteinMPNN weights trained on soluble proteins only.")
+
+
+argparser.add_argument("--seed", type=int, default=0, help="If set to 0 then a random seed will be picked;")
+
+argparser.add_argument("--save_score", type=int, default=0, help="0 for False, 1 for True; save score=-log_prob to npy files")
+argparser.add_argument("--save_probs", type=int, default=0, help="0 for False, 1 for True; save MPNN predicted probabilites per position")
+
+argparser.add_argument("--score_only", type=int, default=0, help="0 for False, 1 for True; score input backbone-sequence pairs")
+argparser.add_argument("--path_to_fasta", type=str, default="", help="score provided input sequence in a fasta format; e.g. GGGGGG/PPPPS/WWW for chains A, B, C sorted alphabetically and separated by /")
+
+
+argparser.add_argument("--conditional_probs_only", type=int, default=0, help="0 for False, 1 for True; output conditional probabilities p(s_i given the rest of the sequence and backbone)")    
+argparser.add_argument("--conditional_probs_only_backbone", type=int, default=0, help="0 for False, 1 for True; if true output conditional probabilities p(s_i given backbone)") 
+argparser.add_argument("--unconditional_probs_only", type=int, default=0, help="0 for False, 1 for True; output unconditional probabilities p(s_i given backbone) in one forward pass")   
+
+argparser.add_argument("--backbone_noise", type=float, default=0.00, help="Standard deviation of Gaussian noise to add to backbone atoms")
+argparser.add_argument("--num_seq_per_target", type=int, default=1, help="Number of sequences to generate per target")
+argparser.add_argument("--batch_size", type=int, default=1, help="Batch size; can set higher for titan, quadro GPUs, reduce this if running out of GPU memory")
+argparser.add_argument("--max_length", type=int, default=200000, help="Max sequence length")
+argparser.add_argument("--sampling_temp", type=str, default="0.1", help="A string of temperatures, 0.2 0.25 0.5. Sampling temperature for amino acids. Suggested values 0.1, 0.15, 0.2, 0.25, 0.3. Higher values will lead to more diversity.")
+
+argparser.add_argument("--out_folder", type=str, help="Path to a folder to output sequences, e.g. /home/out/")
+argparser.add_argument("--pdb_path", type=str, default='', help="Path to a single PDB to be designed")
+argparser.add_argument("--pdb_path_chains", type=str, default='', help="Define which chains need to be designed for a single PDB ")
+argparser.add_argument("--jsonl_path", type=str, help="Path to a folder with parsed pdb into jsonl")
+argparser.add_argument("--chain_id_jsonl",type=str, default='', help="Path to a dictionary specifying which chains need to be designed and which ones are fixed, if not specied all chains will be designed.")
+argparser.add_argument("--fixed_positions_jsonl", type=str, default='', help="Path to a dictionary with fixed positions")
+argparser.add_argument("--omit_AAs", type=list, default='X', help="Specify which amino acids should be omitted in the generated sequence, e.g. 'AC' would omit alanine and cystine.")
+argparser.add_argument("--bias_AA_jsonl", type=str, default='', help="Path to a dictionary which specifies AA composion bias if neededi, e.g. {A: -1.1, F: 0.7} would make A less likely and F more likely.")
+
+argparser.add_argument("--bias_by_res_jsonl", default='', help="Path to dictionary with per position bias.") 
+argparser.add_argument("--omit_AA_jsonl", type=str, default='', help="Path to a dictionary which specifies which amino acids need to be omited from design at specific chain indices")
+argparser.add_argument("--pssm_jsonl", type=str, default='', help="Path to a dictionary with pssm")
+argparser.add_argument("--pssm_multi", type=float, default=0.0, help="A value between [0.0, 1.0], 0.0 means do not use pssm, 1.0 ignore MPNN predictions")
+argparser.add_argument("--pssm_threshold", type=float, default=0.0, help="A value between -inf + inf to restric per position AAs")
+argparser.add_argument("--pssm_log_odds_flag", type=int, default=0, help="0 for False, 1 for True")
+argparser.add_argument("--pssm_bias_flag", type=int, default=0, help="0 for False, 1 for True")
+
+argparser.add_argument("--tied_positions_jsonl", type=str, default='', help="Path to a dictionary with tied positions")
+
+argparser.add_argument("--cyclic_peptide_chain", type=str, help="Cyclic positional encoding will be used for this chain")
+    
+
 if __name__ == "__main__":
-    argparser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    argparser.add_argument("--suppress_print", type=int, default=0, help="0 for False, 1 for True")
-
-  
-    argparser.add_argument("--ca_only", action="store_true", default=False, help="Parse CA-only structures and use CA-only models (default: false)")   
-    argparser.add_argument("--path_to_model_weights", type=str, default="", help="Path to model weights folder;") 
-    argparser.add_argument("--model_name", type=str, default="v_48_020", help="ProteinMPNN model name: v_48_002, v_48_010, v_48_020, v_48_030; v_48_010=version with 48 edges 0.10A noise")
-    argparser.add_argument("--use_soluble_model", action="store_true", default=False, help="Flag to load ProteinMPNN weights trained on soluble proteins only.")
-
-
-    argparser.add_argument("--seed", type=int, default=0, help="If set to 0 then a random seed will be picked;")
- 
-    argparser.add_argument("--save_score", type=int, default=0, help="0 for False, 1 for True; save score=-log_prob to npy files")
-    argparser.add_argument("--save_probs", type=int, default=0, help="0 for False, 1 for True; save MPNN predicted probabilites per position")
-
-    argparser.add_argument("--score_only", type=int, default=0, help="0 for False, 1 for True; score input backbone-sequence pairs")
-    argparser.add_argument("--path_to_fasta", type=str, default="", help="score provided input sequence in a fasta format; e.g. GGGGGG/PPPPS/WWW for chains A, B, C sorted alphabetically and separated by /")
-
-
-    argparser.add_argument("--conditional_probs_only", type=int, default=0, help="0 for False, 1 for True; output conditional probabilities p(s_i given the rest of the sequence and backbone)")    
-    argparser.add_argument("--conditional_probs_only_backbone", type=int, default=0, help="0 for False, 1 for True; if true output conditional probabilities p(s_i given backbone)") 
-    argparser.add_argument("--unconditional_probs_only", type=int, default=0, help="0 for False, 1 for True; output unconditional probabilities p(s_i given backbone) in one forward pass")   
- 
-    argparser.add_argument("--backbone_noise", type=float, default=0.00, help="Standard deviation of Gaussian noise to add to backbone atoms")
-    argparser.add_argument("--num_seq_per_target", type=int, default=1, help="Number of sequences to generate per target")
-    argparser.add_argument("--batch_size", type=int, default=1, help="Batch size; can set higher for titan, quadro GPUs, reduce this if running out of GPU memory")
-    argparser.add_argument("--max_length", type=int, default=200000, help="Max sequence length")
-    argparser.add_argument("--sampling_temp", type=str, default="0.1", help="A string of temperatures, 0.2 0.25 0.5. Sampling temperature for amino acids. Suggested values 0.1, 0.15, 0.2, 0.25, 0.3. Higher values will lead to more diversity.")
-    
-    argparser.add_argument("--out_folder", type=str, help="Path to a folder to output sequences, e.g. /home/out/")
-    argparser.add_argument("--pdb_path", type=str, default='', help="Path to a single PDB to be designed")
-    argparser.add_argument("--pdb_path_chains", type=str, default='', help="Define which chains need to be designed for a single PDB ")
-    argparser.add_argument("--jsonl_path", type=str, help="Path to a folder with parsed pdb into jsonl")
-    argparser.add_argument("--chain_id_jsonl",type=str, default='', help="Path to a dictionary specifying which chains need to be designed and which ones are fixed, if not specied all chains will be designed.")
-    argparser.add_argument("--fixed_positions_jsonl", type=str, default='', help="Path to a dictionary with fixed positions")
-    argparser.add_argument("--omit_AAs", type=list, default='X', help="Specify which amino acids should be omitted in the generated sequence, e.g. 'AC' would omit alanine and cystine.")
-    argparser.add_argument("--bias_AA_jsonl", type=str, default='', help="Path to a dictionary which specifies AA composion bias if neededi, e.g. {A: -1.1, F: 0.7} would make A less likely and F more likely.")
-   
-    argparser.add_argument("--bias_by_res_jsonl", default='', help="Path to dictionary with per position bias.") 
-    argparser.add_argument("--omit_AA_jsonl", type=str, default='', help="Path to a dictionary which specifies which amino acids need to be omited from design at specific chain indices")
-    argparser.add_argument("--pssm_jsonl", type=str, default='', help="Path to a dictionary with pssm")
-    argparser.add_argument("--pssm_multi", type=float, default=0.0, help="A value between [0.0, 1.0], 0.0 means do not use pssm, 1.0 ignore MPNN predictions")
-    argparser.add_argument("--pssm_threshold", type=float, default=0.0, help="A value between -inf + inf to restric per position AAs")
-    argparser.add_argument("--pssm_log_odds_flag", type=int, default=0, help="0 for False, 1 for True")
-    argparser.add_argument("--pssm_bias_flag", type=int, default=0, help="0 for False, 1 for True")
-    
-    argparser.add_argument("--tied_positions_jsonl", type=str, default='', help="Path to a dictionary with tied positions")
-    
     args = argparser.parse_args()    
     main(args)   
